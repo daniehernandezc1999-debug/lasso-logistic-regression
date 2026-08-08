@@ -6,6 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import seaborn as sns
+from rocauc_comparison import delong_roc_test
 import warnings
 warnings.filterwarnings('ignore')
  
@@ -779,8 +780,8 @@ def compute_midrank(x):
     T2 = np.empty(N, dtype=float)
     T2[J] = T
     return T2
- 
- 
+
+
 def fastDeLong(predictions_sorted_transposed, label_1_count):
     """
     predictions_sorted_transposed: array (k modelos, n observaciones),
@@ -789,12 +790,12 @@ def fastDeLong(predictions_sorted_transposed, label_1_count):
     label_1_count: número de observaciones positivas (default=1).
     Retorna: AUCs de cada modelo y su matriz de covarianza (DeLong).
     """
-    m = label_1_count                      # n positivos
-    n = predictions_sorted_transposed.shape[1] - m   # n negativos
+    m = label_1_count
+    n = predictions_sorted_transposed.shape[1] - m
     positive_examples = predictions_sorted_transposed[:, :m]
     negative_examples = predictions_sorted_transposed[:, m:]
     k = predictions_sorted_transposed.shape[0]
- 
+
     tx = np.empty([k, m], dtype=float)
     ty = np.empty([k, n], dtype=float)
     tz = np.empty([k, m + n], dtype=float)
@@ -802,7 +803,7 @@ def fastDeLong(predictions_sorted_transposed, label_1_count):
         tx[r, :] = compute_midrank(positive_examples[r, :])
         ty[r, :] = compute_midrank(negative_examples[r, :])
         tz[r, :] = compute_midrank(predictions_sorted_transposed[r, :])
- 
+
     aucs = tz[:, :m].sum(axis=1) / m / n - float(m + 1.0) / (2.0 * n)
     v01 = (tz[:, :m] - tx[:, :]) / n
     v10 = 1.0 - (tz[:, m:] - ty[:, :]) / m
@@ -810,59 +811,75 @@ def fastDeLong(predictions_sorted_transposed, label_1_count):
     sy = np.cov(v10)
     delongcov = sx / m + sy / n
     return aucs, delongcov
- 
- 
-def delong_roc_test(y_true, prob_A, prob_B):
+
+
+def delong_roc_test(y_true, prob_A, prob_B, alpha=0.05):
     """
     Compara los AUC de dos modelos (prob_A, prob_B) evaluados sobre el
-    MISMO y_true (por eso se usa DeLong y no una prueba de muestras
-    independientes).
-    Retorna: z (estadístico), p-valor (bilateral), y las AUC de A y B.
+    MISMO y_true. Retorna z, p-valor, AUCs, delta_AUC, error estándar
+    y el intervalo de confianza (1-alpha) para AUC_B - AUC_A.
     """
     y_true = np.asarray(y_true)
-    order = (-y_true).argsort()              # positivos primero
+    order = (-y_true).argsort()
     label_1_count = int(y_true.sum())
     predictions_sorted_transposed = np.vstack([prob_A, prob_B])[:, order]
- 
+
     aucs, delongcov = fastDeLong(predictions_sorted_transposed, label_1_count)
     l_vec = np.array([[1, -1]])
     var = np.dot(np.dot(l_vec, delongcov), l_vec.T)[0, 0]
- 
-    z = (aucs[0] - aucs[1]) / np.sqrt(var)
+    se = np.sqrt(var)
+
+    z = (aucs[0] - aucs[1]) / se
     p = 2 * (1 - stats.norm.cdf(np.abs(z)))
-    return z, p, aucs
- 
- 
+
+    delta_auc = aucs[1] - aucs[0]
+    z_crit = stats.norm.ppf(1 - alpha / 2)
+    ic_inf = delta_auc - z_crit * se
+    ic_sup = delta_auc + z_crit * se
+
+    return z, p, aucs, delta_auc, se, (ic_inf, ic_sup)
+
+
 # ── 9.1 Comparación central: M1 vs M2 (Filtro 1 de la Regla de Decisión) ────
-z_12, p_12, aucs_12 = delong_roc_test(y_test.values, y_prob_m1, y_prob_m2)
- 
+z_12, p_12, aucs_12, delta_12, se_12, ic_12 = delong_roc_test(
+    y_test.values, y_prob_m1, y_prob_m2
+)
+
 print("\n── DeLong: M1 (Clásica) vs M2 (LASSO óptimo por CV) ──")
 print(f"  AUC M1        : {aucs_12[0]:.4f}")
 print(f"  AUC M2        : {aucs_12[1]:.4f}")
-print(f"  ΔAUC          : {aucs_12[1] - aucs_12[0]:+.4f}")
+print(f"  ΔAUC          : {delta_12:+.4f}")
+print(f"  Error estándar: {se_12:.4f}")
+print(f"  IC 95% ΔAUC   : [{ic_12[0]:+.4f}, {ic_12[1]:+.4f}]")
 print(f"  Estadístico Z : {z_12:.4f}")
 print(f"  p-valor       : {p_12:.4f}")
 print(f"  ¿Significativo (α=0.05)? {'Sí' if p_12 < 0.05 else 'No'}")
- 
+print(f"  (detalle) ΔAUC = {delta_12:.6f}   IC 95% = [{ic_12[0]:.6f}, {ic_12[1]:.6f}]")
+
 # ── 9.2 Comparación adicional: M1 vs M2 financiero (C=0.01, 16 vars) ────────
-# Útil para la sección V-D / Resultado Central: valida si el modelo
-# parsimonioso (16 variables) mantiene el desempeño estad. de M1.
-z_1fin, p_1fin, aucs_1fin = delong_roc_test(y_test.values, y_prob_m1, y_prob_fin)
- 
+z_1fin, p_1fin, aucs_1fin, delta_1fin, se_1fin, ic_1fin = delong_roc_test(
+    y_test.values, y_prob_m1, y_prob_fin
+)
+
 print("\n── DeLong: M1 (Clásica) vs M2 financiero (C=0.01, 16 vars) ──")
 print(f"  AUC M1            : {aucs_1fin[0]:.4f}")
 print(f"  AUC M2 financiero : {aucs_1fin[1]:.4f}")
-print(f"  ΔAUC              : {aucs_1fin[1] - aucs_1fin[0]:+.4f}")
+print(f"  ΔAUC              : {delta_1fin:+.4f}")
+print(f"  Error estándar    : {se_1fin:.4f}")
+print(f"  IC 95% ΔAUC       : [{ic_1fin[0]:+.4f}, {ic_1fin[1]:+.4f}]")
 print(f"  Estadístico Z     : {z_1fin:.4f}")
 print(f"  p-valor           : {p_1fin:.4f}")
 print(f"  ¿Significativo (α=0.05)? {'Sí' if p_1fin < 0.05 else 'No'}")
- 
+
 # Guardamos resultados para redactar el Resultado Central (IV-D) con precisión
 delong_resultados = pd.DataFrame({
     'Comparación': ['M1 vs M2 (LASSO óptimo)', 'M1 vs M2 financiero (C=0.01)'],
     'AUC_A': [aucs_12[0], aucs_1fin[0]],
     'AUC_B': [aucs_12[1], aucs_1fin[1]],
-    'Delta_AUC': [aucs_12[1]-aucs_12[0], aucs_1fin[1]-aucs_1fin[0]],
+    'Delta_AUC': [delta_12, delta_1fin],
+    'SE': [se_12, se_1fin],
+    'IC_inf_95': [ic_12[0], ic_1fin[0]],
+    'IC_sup_95': [ic_12[1], ic_1fin[1]],
     'Z': [z_12, z_1fin],
     'p_valor': [p_12, p_1fin]
 })
